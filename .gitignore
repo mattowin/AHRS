@@ -1,0 +1,36 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+*/Debug/
+*/Release/
+
+# Eclipse/CubeIDE project metadata (usually safe to ignore, regenerable)
+.metadata/
+.settings/
+.cproject
+.project
+
+# CubeMX generated build artifacts (keep generated source, ignore build junk)
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.d
+
+# Launch configs (often machine-specific paths — optional, see note below)
+*.launch
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# VS Code (if you're editing the same folder there)
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
