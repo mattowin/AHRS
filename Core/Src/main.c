@@ -21,7 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ism330dhcx.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +33,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* Output register block. Reading from OUT_TEMP_L picks up temperature,
+   gyro and accel in a single 14-byte burst (IF_INC is set by CTRL3_C). */
+#define ISM_OUT_TEMP_L      0x20
+#define ISM_BURST_BYTES     14
+#define ISM_SPI_READ        0x80
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,7 +53,20 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+static volatile uint8_t  imu_sample_ready = 0;
+static volatile uint32_t sample_n = 0;      /* incremented in the ISR, not the
+                                               main loop, so a missed timer tick
+                                               shows up as a counter gap on the
+                                               host instead of vanishing */
+static char uart_buf[96];
 
+/* Raw sensor counts for one sample. No scaling on the MCU - the host applies
+   the scale factors during analysis. */
+typedef struct {
+    int16_t temp;
+    int16_t g[3];
+    int16_t a[3];
+} ISM330DHCX_Raw;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,12 +76,44 @@ static void MX_SPI2_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void ISM330DHCX_ReadRaw(ISM330DHCX_Raw *out);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2) {
+        sample_n++;
+        imu_sample_ready = 1;
+    }
+}
 
+/**
+  * @brief Burst-read temperature + gyro + accel in one SPI transaction.
+  *
+  * Register layout (ISM330DHCX, little-endian - low byte first):
+  *   0x20/0x21  OUT_TEMP_L/H
+  *   0x22..0x27 OUTX/Y/Z_L/H_G
+  *   0x28..0x2D OUTX/Y/Z_L/H_A
+  */
+static void ISM330DHCX_ReadRaw(ISM330DHCX_Raw *out)
+{
+    uint8_t tx[1 + ISM_BURST_BYTES] = { ISM_OUT_TEMP_L | ISM_SPI_READ };
+    uint8_t rx[1 + ISM_BURST_BYTES];
+
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
+    HAL_SPI_TransmitReceive(&hspi2, tx, rx, sizeof(tx), HAL_MAX_DELAY);
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+
+    out->temp = (int16_t)((uint16_t)rx[2]  << 8 | rx[1]);
+    out->g[0] = (int16_t)((uint16_t)rx[4]  << 8 | rx[3]);
+    out->g[1] = (int16_t)((uint16_t)rx[6]  << 8 | rx[5]);
+    out->g[2] = (int16_t)((uint16_t)rx[8]  << 8 | rx[7]);
+    out->a[0] = (int16_t)((uint16_t)rx[10] << 8 | rx[9]);
+    out->a[1] = (int16_t)((uint16_t)rx[12] << 8 | rx[11]);
+    out->a[2] = (int16_t)((uint16_t)rx[14] << 8 | rx[13]);
+}
 /* USER CODE END 0 */
 
 /**
@@ -98,13 +149,68 @@ int main(void)
   MX_TIM2_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  const char *boot_msg = "UART OK - starting IMU init...\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg, strlen(boot_msg), HAL_MAX_DELAY);
+
+  uint8_t who = ISM330DHCX_ReadReg(ISM330DHCX_WHO_AM_I);
+  char who_msg[64];
+  int who_len = snprintf(who_msg, sizeof(who_msg),
+      "WHO_AM_I: 0x%02X (expect 0x6B)\r\n", who);
+
+  uint32_t bad = 0;
+  for (uint32_t i = 0; i < 1000u; i++) {
+      if (ISM330DHCX_ReadReg(ISM330DHCX_WHO_AM_I) != ISM330DHCX_WHO_AM_I_VAL) {
+          bad++;
+      }
+      HAL_Delay(10);          /* same spacing as the capture loop */
+  }
+  char chk[64];
+  int chk_len = snprintf(chk, sizeof(chk), "SPI check: %lu / 10000 bad\r\n",
+                         (unsigned long)bad);
+  HAL_UART_Transmit(&huart2, (uint8_t *)chk, chk_len, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart2, (uint8_t *)who_msg, who_len, HAL_MAX_DELAY);
+
+  if (ISM330DHCX_Init() != HAL_OK) {
+      while (1) {
+          HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+          HAL_Delay(100);   /* fast blink = WHO_AM_I mismatch / SPI wiring issue */
+      }
+  }
+
+  /* CSV column order, matching allan_logger.py:
+       n,gx,gy,gz,ax,ay,az,temp                                            */
+  const char *hdr = "# n,gx,gy,gz,ax,ay,az,temp (raw counts)\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t *)hdr, strlen(hdr), HAL_MAX_DELAY);
+
   HAL_TIM_Base_Start_IT(&htim2);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+      if (imu_sample_ready) {
+          imu_sample_ready = 0;
+          uint32_t n = sample_n;
+
+          ISM330DHCX_Raw raw;
+          ISM330DHCX_ReadRaw(&raw);
+
+          int len = snprintf(uart_buf, sizeof(uart_buf),
+              "%lu,%d,%d,%d,%d,%d,%d,%d\r\n",
+              (unsigned long)n,
+              raw.g[0], raw.g[1], raw.g[2],
+              raw.a[0], raw.a[1], raw.a[2],
+              raw.temp);
+
+          HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, len, HAL_MAX_DELAY);
+
+          /* 1 Hz heartbeat - a glance at the board confirms the run is alive */
+          if ((n % 50u) == 0u) {
+              HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+          }
+      }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -189,7 +295,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
   hspi2.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -266,7 +372,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 230400;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;

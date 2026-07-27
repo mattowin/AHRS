@@ -33,4 +33,8 @@ Thumbs.db
 
 # Logs / temp
 *.log
-*.tmp
+*.tmp*.csv
+*.csv
+*.csv
+*.csv
+!data/allan_excerpt_10min.csv
