@@ -19,11 +19,16 @@ v2 changes
   coupling (motion-correlated), band-limited vibration, impulsive taps.
 * The v1 disturbance model is retained as --legacy-disturbance so earlier
   results remain reproducible.
+* Motion profile registry: --profile gentle|brisk. 'gentle' is v1's
+  make_truth unchanged and regenerates earlier baselines bit-identically.
+* Tau sweep floor lowered 0.05 -> 0.005 s. The clean-case optimum is
+  0.026 s, so every earlier "best tau = 0.050" was the sweep reporting its
+  own lower bound. Boundary minima are now flagged explicitly.
 
 Usage:
     python3 filter_testbench.py
-    python3 filter_testbench.py --lever-arm 0.03
-    python3 filter_testbench.py --lever-arm 0.03 --vib 0.05 --taps 0.3
+    python3 filter_testbench.py --profile brisk --lever-arm 0.03
+    python3 filter_testbench.py --profile brisk --lever-arm 0.03 --vib 0.05 --taps 0.3
     python3 filter_testbench.py --legacy-disturbance 0.5
 """
 
@@ -95,6 +100,45 @@ def make_truth(duration_s):
 
     static = (t < 55.0) | (t > 245.0)
     return t, angle, rate, static
+
+
+def make_truth_brisk(duration_s):
+    """As make_truth, plus a 25 deg/s 0.8 Hz term in the manoeuvring segment.
+
+    Rationale: the 'gentle' profile peaks at 14 deg/s and 0.129 rad/s^2, about
+    27x gentler in angular acceleration than a brisk hand rotation. Lever-arm
+    coupling scales as alpha*r_z, so at that acceleration a 30 mm offset
+    produces 0.009 deg RMS tilt error -- an order of magnitude BELOW the
+    accelerometer noise floor. The gentle profile therefore cannot exercise
+    the dominant dynamic error mechanism, and a filter comparison run on it
+    is a comparison under conditions neither filter finds difficult.
+
+    This profile reaches 39 deg/s and 2.32 rad/s^2, which puts lever-arm
+    tilt error at 0.208 deg RMS / 0.407 deg peak for r_z = 30 mm.
+
+    make_truth is left untouched so existing baselines regenerate exactly.
+    """
+    t = np.arange(0.0, duration_s, DT)
+
+    env = (0.5 * (1 + np.tanh((t - 60.0) / 4.0))
+           * 0.5 * (1 + np.tanh((240.0 - t) / 4.0)))
+
+    rate = env * (10.0 * np.sin(2 * np.pi * 0.05 * t)
+                  + 4.0 * np.sin(2 * np.pi * 0.17 * t + 1.1)
+                  + 25.0 * np.sin(2 * np.pi * 0.80 * t + 0.4))   # deg/s
+    angle = np.cumsum(rate) * DT                                 # deg
+
+    static = (t < 55.0) | (t > 245.0)
+    return t, angle, rate, static
+
+
+# Score Phase 4 on both and report both columns: "here is the filter under
+# gentle motion, here it is under motion that excites the disturbance
+# mechanisms" is a stronger result than either alone.
+PROFILES = {
+    "gentle": make_truth,
+    "brisk": make_truth_brisk,
+}
 
 
 def simulate_imu(angle_deg, rate_dps, rng, legacy_disturbance=0.0,
@@ -186,6 +230,10 @@ def rms(x):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration", type=float, default=300.0)
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="gentle",
+                    help="motion profile; 'gentle' reproduces earlier "
+                         "baselines exactly, 'brisk' exercises lever-arm "
+                         "coupling (default: gentle)")
     ap.add_argument("--lever-arm", type=float, default=0.0,
                     help="sensor offset r_z from rotation axis, metres "
                          "(try 0.03)")
@@ -197,12 +245,16 @@ def main():
                     help="impulsive tap rate, events/s (try 0.3)")
     ap.add_argument("--legacy-disturbance", type=float, default=0.0,
                     help="v1 disturbance model RMS in m/s^2 (try 0.5)")
+    ap.add_argument("--tau-min", type=float, default=0.005,
+                    help="lower bound of the tau sweep, s (default 0.005)")
+    ap.add_argument("--tau-max", type=float, default=100.0,
+                    help="upper bound of the tau sweep, s (default 100)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--plot", default="filter_tuning.png")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    t, truth, rate, static = make_truth(args.duration)
+    t, truth, rate, static = PROFILES[args.profile](args.duration)
     gyro, ax, az, bias, dist = simulate_imu(
         truth, rate, rng,
         legacy_disturbance=args.legacy_disturbance,
@@ -212,7 +264,10 @@ def main():
 
     # reference points: what each sensor gives you alone
     gyro_only = np.cumsum(gyro) * DT
+    alpha_pk = np.abs(np.gradient(np.deg2rad(rate), DT)).max()
     print(f"samples          : {len(t)}  ({args.duration:.0f} s @ {FS:.2f} Hz)")
+    print(f"profile          : {args.profile}  "
+          f"(peak {np.abs(rate).max():.1f} deg/s, {alpha_pk:.3f} rad/s^2)")
     print(f"lever arm        : r_z={args.lever_arm:.3f} m  r_x={args.lever_arm_x:.3f} m")
     print(f"vibration        : {args.vib:.3f} m/s^2 RMS/axis")
     print(f"taps             : {args.taps:.2f} /s")
@@ -232,7 +287,10 @@ def main():
               f"-- what a norm gate actually sees")
     print()
 
-    taus = np.logspace(np.log10(0.05), np.log10(100.0), 25)
+    # Floor is 0.005 s, not 0.05 s. The clean-case optimum is 0.026 s, so the
+    # original range railed against its own lower bound and reported that
+    # bound as "best tau". Rail detection below guards against a recurrence.
+    taus = np.logspace(np.log10(args.tau_min), np.log10(args.tau_max), 41)
     all_rms, stat_rms, dyn_rms = [], [], []
     for tau in taus:
         est = complementary(gyro, angle_acc, tau)
@@ -248,16 +306,28 @@ def main():
           f"{'RMS dynamic':>12}")
     for i, tau in enumerate(taus):
         mark = "  <-- best" if i == int(np.argmin(all_rms)) else ""
-        print(f"{tau:9.3f} {tau/(tau+DT):9.6f} {all_rms[i]:10.4f} "
+        print(f"{tau:9.4f} {tau/(tau+DT):9.6f} {all_rms[i]:10.4f} "
               f"{stat_rms[i]:11.4f} {dyn_rms[i]:12.4f}{mark}")
 
+    print()
+    railed = False
+    for label, arr in (("all", all_rms), ("static", stat_rms),
+                       ("dynamic", dyn_rms)):
+        i = int(np.argmin(arr))
+        edge = ""
+        if i == 0:
+            edge = "  [RAILED at tau_min - true optimum is lower]"
+            railed = True
+        elif i == len(taus) - 1:
+            edge = "  [RAILED at tau_max - true optimum is higher]"
+            railed = True
+        print(f"best tau ({label:<7}) = {taus[i]:8.4f} s  "
+              f"(alpha = {taus[i]/(taus[i]+DT):.6f}, "
+              f"RMS = {arr[i]:.4f} deg){edge}")
+    if railed:
+        print("\n*** A minimum at a sweep boundary is not an optimum. Widen the "
+              "range with --tau-min / --tau-max before quoting these numbers.")
     best = taus[int(np.argmin(all_rms))]
-    print(f"\nbest tau (all)     = {best:.3f} s  (alpha = {best/(best+DT):.6f}, "
-          f"RMS = {all_rms.min():.4f} deg)")
-    print(f"best tau (static)  = {taus[int(np.argmin(stat_rms))]:.3f} s  "
-          f"(RMS = {stat_rms.min():.4f} deg)")
-    print(f"best tau (dynamic) = {taus[int(np.argmin(dyn_rms))]:.3f} s  "
-          f"(RMS = {dyn_rms.min():.4f} deg)")
 
     if plt is None:
         print("matplotlib not installed - skipping plot")
@@ -272,7 +342,7 @@ def main():
     axes[0].axvline(best, color="k", ls=":", lw=0.8)
     axes[0].set_xlabel(r"filter time constant $\tau$ (s)")
     axes[0].set_ylabel("RMS pitch error (deg)")
-    axes[0].set_title("Tuning sweep")
+    axes[0].set_title(f"Tuning sweep - {args.profile} profile")
     axes[0].grid(True, which="both", alpha=0.3)
     axes[0].legend()
 
