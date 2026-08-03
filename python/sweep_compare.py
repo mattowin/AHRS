@@ -5,7 +5,7 @@ def run(label, **kw):
     t, truth, rate, static = fb.make_truth(300.0)
     gyro, ax, az, bias, dist = fb.simulate_imu(truth, rate, rng, **kw)
     aa = fb.accel_angle(ax, az)
-    taus = np.logspace(np.log10(0.005), np.log10(100.0), 61)
+    taus = np.logspace(np.log10(0.005), np.log10(100.0), 41)
     A=[];S=[];D=[]
     for tau in taus:
         e = fb.complementary(gyro, aa, tau) - truth
